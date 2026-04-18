@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BrowserRelay</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; }
+    h1 { font-size: 1.5rem; margin-bottom: 8px; }
+    .subtitle { color: #666; font-size: 0.9rem; margin-bottom: 24px; }
+    .status { padding: 12px 16px; border-radius: 8px; margin: 16px 0; font-weight: 500; }
+    .disconnected { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+    .connected { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+    .connecting { background: #fffbeb; color: #d97706; border: 1px solid #fed7aa; }
+    .info { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; padding: 12px 16px; border-radius: 8px; margin: 12px 0; font-size: 0.85rem; }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+    .stat { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; text-align: center; }
+    .stat-value { font-size: 1.5rem; font-weight: 700; color: #374151; }
+    .stat-label { font-size: 0.75rem; color: #9ca3af; margin-top: 4px; }
+    .log { background: #1f2937; color: #d1d5db; border-radius: 8px; padding: 12px; margin: 16px 0; max-height: 300px; overflow-y: auto; font-family: 'SF Mono', Monaco, 'Cascadia Mono', monospace; font-size: 0.8rem; line-height: 1.6; }
+    .log-entry { padding: 2px 0; }
+    .log-time { color: #6b7280; }
+    .log-info { color: #60a5fa; }
+    .log-success { color: #34d399; }
+    .log-error { color: #f87171; }
+    .log-warn { color: #fbbf24; }
+    button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: background 0.2s; }
+    button:hover { background: #2563eb; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    button.danger { background: #ef4444; }
+    button.danger:hover { background: #dc2626; }
+  </style>
+</head>
+<body>
+  <h1>BrowserRelay</h1>
+  <p class="subtitle">Stream HTTP requests through your browser via WebSocket</p>
+
+  <div id="status" class="status disconnected">Disconnected</div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-value" id="requestCount">0</div>
+      <div class="stat-label">Requests Relayed</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="activeRequests">0</div>
+      <div class="stat-label">Active Requests</div>
+    </div>
+  </div>
+
+  <div class="info">
+    <strong>Usage:</strong> After connecting, use curl to send requests through this relay:<br>
+    <code>curl -X POST http://localhost:3000/proxy \\<br>
+    &nbsp;&nbsp;-H "X-Proxy-Session: <span id="sessionIdDisplay">---</span>" \\<br>
+    &nbsp;&nbsp;-H "X-Proxy-URL: https://httpbin.org/get" \\<br>
+    &nbsp;&nbsp;-H "X-Proxy-Method: GET"</code>
+  </div>
+
+  <div>
+    <button id="connectBtn" onclick="startRelay()">Connect</button>
+    <button id="disconnectBtn" onclick="disconnect()" style="display:none" class="danger">Disconnect</button>
+  </div>
+
+  <div class="log" id="log">
+    <div class="log-entry"><span class="log-time">[--:--:--]</span> Waiting to connect...</div>
+  </div>
+
+  <script>
+    const MSG_TYPE = {
+      REQUEST_START: 0x01, REQUEST_CHUNK: 0x02, REQUEST_END: 0x03,
+      RESPONSE_START: 0x11, RESPONSE_CHUNK: 0x12, RESPONSE_END: 0x13,
+      ABORT: 0x21, ACK: 0x30, PING: 0x40, PONG: 0x41,
+    };
+    const ACK_THRESHOLD = 64 * 1024;
+    const WS_URL = `ws://${location.host}/ws`;
+
+    let ws = null;
+    let sessionId = null;
+    let totalRequests = 0;
+    let activeRequests = 0;
+
+    function log(msg, level = 'info') {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      entry.innerHTML = `<span class="log-time">[${time}]</span> <span class="log-${level}">${msg}</span>`;
+      el.appendChild(entry);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(text, cls) {
+      const el = document.getElementById('status');
+      el.textContent = text;
+      el.className = 'status ' + cls;
+    }
+
+    function updateStats() {
+      document.getElementById('requestCount').textContent = totalRequests;
+      document.getElementById('activeRequests').textContent = activeRequests;
+    }
+
+    function uuidToBytes(uuid) {
+      const hex = uuid.replace(/-/g, '');
+      const bytes = new Uint8Array(16);
+      for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+      return bytes;
+    }
+
+    function bytesToUUID(bytes) {
+      const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      return [hex.slice(0,8), hex.slice(8,12), hex.slice(12,16), hex.slice(16,20), hex.slice(20,32)].join('-');
+    }
+
+    function readString32(data, offset) {
+      const len = data.getUint32(offset);
+      const str = new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset + offset + 4, len));
+      return { value: str, nextOffset: offset + 4 + len };
+    }
+
+    // --- Protocol encode ---
+    function encodePong() {
+      return new Uint8Array([MSG_TYPE.PONG]);
+    }
+
+    function encodeResponseStart(requestId, status, headers) {
+      const headersJson = new TextEncoder().encode(JSON.stringify(headers));
+      const buf = new ArrayBuffer(1 + 16 + 2 + 4 + headersJson.length);
+      const view = new DataView(buf);
+      let off = 0;
+      new Uint8Array(buf)[off] = MSG_TYPE.RESPONSE_START; off++;
+      new Uint8Array(buf).set(requestId, off); off += 16;
+      view.setUint16(off, status); off += 2;
+      new TextEncoder().encodeInto(JSON.stringify(headers), new Uint8Array(buf, off + 4));
+      view.setUint32(off, headersJson.length); off += 4;
+      return new Uint8Array(buf);
+    }
+
+    function encodeResponseChunk(requestId, data) {
+      const buf = new Uint8Array(1 + 16 + data.length);
+      buf[0] = MSG_TYPE.RESPONSE_CHUNK;
+      buf.set(requestId, 1);
+      buf.set(data, 17);
+      return buf;
+    }
+
+    function encodeResponseEnd(requestId) {
+      const buf = new Uint8Array(1 + 16);
+      buf[0] = MSG_TYPE.RESPONSE_END;
+      buf.set(requestId, 1);
+      return buf;
+    }
+
+    function encodeAbort(requestId, message) {
+      const msgBytes = new TextEncoder().encode(message);
+      const buf = new Uint8Array(1 + 16 + msgBytes.length);
+      buf[0] = MSG_TYPE.ABORT;
+      buf.set(requestId, 1);
+      buf.set(msgBytes, 17);
+      return buf;
+    }
+
+    function encodeAck(requestId, windowBytes) {
+      const buf = new Uint8Array(1 + 16 + 4);
+      buf[0] = MSG_TYPE.ACK;
+      buf.set(requestId, 1);
+      new DataView(buf.buffer).setUint32(17, windowBytes);
+      return buf;
+    }
+
+    // --- Request handler ---
+    const pendingFetches = new Map();
+
+    async function handleRequestStart(requestId, method, url, headers) {
+      const requestIdStr = bytesToUUID(requestId);
+      totalRequests++;
+      activeRequests++;
+      updateStats();
+      log(`-> ${method} ${url}`, 'info');
+
+      let bytesReceived = 0;
+      let lastAck = 0;
+
+      const bodyStream = new ReadableStream({
+        start(controller) {
+          pendingFetches.set(requestIdStr, {
+            requestId,
+            controller,
+            bytesReceived: 0,
+            lastAck: 0,
+          });
+        }
+      });
+
+      try {
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : bodyStream,
+          duplex: 'half',
+        });
+
+        // Send RESPONSE_START
+        const respHeaders = {};
+        response.headers.forEach((v, k) => { respHeaders[k] = v; });
+        ws.send(encodeResponseStart(requestId, response.status, respHeaders));
+
+        // Stream response body
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          ws.send(encodeResponseChunk(requestId, value));
+        }
+        ws.send(encodeResponseEnd(requestId));
+
+        log(`<- ${response.status} ${url}`, response.ok ? 'success' : 'warn');
+      } catch (err) {
+        log(`Error: ${err.message}`, 'error');
+        ws.send(encodeAbort(requestId, err.message));
+      } finally {
+        pendingFetches.delete(requestIdStr);
+        activeRequests--;
+        updateStats();
+      }
+    }
+
+    function handleRequestChunk(requestId, data) {
+      const pending = pendingFetches.get(bytesToUUID(requestId));
+      if (!pending) return;
+
+      pending.controller.enqueue(data);
+
+      // Backpressure ACK
+      pending.bytesReceived += data.length;
+      if (pending.bytesReceived - pending.lastAck >= ACK_THRESHOLD) {
+        ws.send(encodeAck(requestId, pending.bytesReceived - pending.lastAck));
+        pending.lastAck = pending.bytesReceived;
+      }
+    }
+
+    function handleRequestEnd(requestId) {
+      const pending = pendingFetches.get(bytesToUUID(requestId));
+      if (!pending) return;
+      pending.controller.close();
+    }
+
+    // --- WebSocket message handler ---
+    function handleMessage(event) {
+      const data = new DataView(event.data);
+      const type = data.getUint8(0);
+
+      if (type === MSG_TYPE.PING) {
+        ws.send(encodePong());
+        return;
+      }
+
+      const requestId = new Uint8Array(event.data.slice(1, 17));
+
+      switch (type) {
+        case MSG_TYPE.REQUEST_START: {
+          let off = 17;
+          const { value: method, nextOffset: o1 } = readString32(data, off);
+          const { value: url, nextOffset: o2 } = readString32(data, o1);
+          const { value: headersJson } = readString32(data, o2);
+          const headers = JSON.parse(headersJson);
+          handleRequestStart(requestId, method, url, headers);
+          break;
+        }
+        case MSG_TYPE.REQUEST_CHUNK: {
+          const chunk = new Uint8Array(event.data.slice(17));
+          handleRequestChunk(requestId, chunk);
+          break;
+        }
+        case MSG_TYPE.REQUEST_END: {
+          handleRequestEnd(requestId);
+          break;
+        }
+      }
+    }
+
+    // --- Connection lifecycle ---
+    async function startRelay() {
+      setStatus('Connecting...', 'connecting');
+      document.getElementById('connectBtn').disabled = true;
+
+      try {
+        // Login
+        const loginResp = await fetch('/login', { method: 'POST' });
+        const { sessionId: sid, wsToken } = await loginResp.json();
+        sessionId = sid;
+        document.getElementById('sessionIdDisplay').textContent = sid;
+        log(`Logged in: ${sid}`, 'success');
+
+        // Connect WebSocket
+        ws = new WebSocket(`${WS_URL}?token=${wsToken}`);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          setStatus('Connected', 'connected');
+          document.getElementById('connectBtn').style.display = 'none';
+          document.getElementById('disconnectBtn').style.display = '';
+          log('WebSocket connected', 'success');
+        };
+
+        ws.onmessage = handleMessage;
+
+        ws.onclose = (e) => {
+          setStatus('Disconnected', 'disconnected');
+          document.getElementById('connectBtn').style.display = '';
+          document.getElementById('connectBtn').disabled = false;
+          document.getElementById('disconnectBtn').style.display = 'none';
+          log(`WebSocket closed: ${e.code} ${e.reason}`, 'warn');
+          ws = null;
+        };
+
+        ws.onerror = (e) => {
+          log('WebSocket error', 'error');
+        };
+
+      } catch (err) {
+        setStatus('Connection failed', 'disconnected');
+        document.getElementById('connectBtn').disabled = false;
+        log(`Failed: ${err.message}`, 'error');
+      }
+    }
+
+    function disconnect() {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+    }
+  </script>
+</body>
+</html>
