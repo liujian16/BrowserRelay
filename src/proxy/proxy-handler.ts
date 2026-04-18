@@ -4,6 +4,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { PassThrough } from 'node:stream';
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import type { SessionManager } from '../session/SessionManager.js';
 import {
@@ -66,13 +67,18 @@ export function proxyHandler(sm: SessionManager) {
 
       const ws = session.wsConnection;
 
-      // Create promises for response lifecycle
+      // Create PassThrough stream for streaming response back to client
+      const responseStream = new PassThrough();
+      // Suppress stream errors when destroyed before being consumed (e.g., timeout, abort, disconnect)
+      responseStream.on('error', () => {});
+
+      // Create promise for response start (status + headers)
       const responseStarted = new Promise<{ status: number; headers: Record<string, string> }>((resolve, reject) => {
         const timeoutHandle = setTimeout(() => {
+          responseStream.destroy(new Error('Proxy request timeout'));
           reject(new Error('Proxy request timeout'));
         }, PROXY_TIMEOUT_MS);
 
-        const chunks: Buffer[] = [];
         let responseInfo: { status: number; headers: Record<string, string> } | null = null;
 
         const pending = {
@@ -83,6 +89,7 @@ export function proxyHandler(sm: SessionManager) {
           },
           reject: (reason: unknown) => {
             clearTimeout(timeoutHandle);
+            responseStream.destroy(reason instanceof Error ? reason : new Error(String(reason)));
             reject(reason);
           },
           timeoutHandle,
@@ -95,13 +102,18 @@ export function proxyHandler(sm: SessionManager) {
           responseHeaders: null as Record<string, string> | null,
           responseStatus: null as number | null,
           abortController: new AbortController(),
-          _chunks: chunks,
-          _ended: false,
-          _endResolve: () => {},
           _responseInfo: responseInfo,
           _setResponseInfo: (info: { status: number; headers: Record<string, string> }) => {
             responseInfo = info;
             resolve(info);
+          },
+          _writeChunk: (chunk: Buffer) => {
+            responseStream.write(chunk);
+          },
+          _finishResponse: () => {
+            clearTimeout(timeoutHandle);
+            responseStream.end();
+            sm.removePendingRequest(sessionId, requestId);
           },
           _resume: () => {},
         };
@@ -155,40 +167,22 @@ export function proxyHandler(sm: SessionManager) {
       try {
         const { status, headers } = await responseStarted;
 
-        // Wait for all chunks and end
-        const pending = sm.getPendingRequest(sessionId, requestId);
-        const allChunksReceived = new Promise<void>((resolve) => {
-          if (pending && (pending as any)._ended) {
-            resolve();
-          } else if (pending) {
-            (pending as any)._endResolve = resolve;
-          }
-        });
-
-        await allChunksReceived;
-
-        // Get final chunks
-        const finalPending = sm.getPendingRequest(sessionId, requestId);
-        const chunks: Buffer[] = (finalPending as any)?._chunks ?? [];
-
-        // Send response
+        // Filter headers — remove hop-by-hop and content-length (streaming uses chunked encoding)
         const filteredHeaders: Record<string, string> = {};
         for (const [key, value] of Object.entries(headers)) {
           const lower = key.toLowerCase();
-          if (!['transfer-encoding', 'connection', 'keep-alive'].includes(lower)) {
+          if (!['transfer-encoding', 'connection', 'keep-alive', 'content-length'].includes(lower)) {
             filteredHeaders[key] = value;
           }
         }
 
-        return reply.code(status).headers(filteredHeaders).send(Buffer.concat(chunks));
+        return reply.code(status).headers(filteredHeaders).send(responseStream);
       } catch (err: any) {
         sm.removePendingRequest(sessionId, requestId);
         if (err.message === 'Proxy request timeout') {
           return reply.code(504).send({ error: 'Gateway timeout' });
         }
         return reply.code(502).send({ error: err.message || 'Proxy error' });
-      } finally {
-        sm.removePendingRequest(sessionId, requestId);
       }
     });
   };

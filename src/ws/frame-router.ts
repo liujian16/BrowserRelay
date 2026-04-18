@@ -48,8 +48,8 @@ export function routeFrame(
       const pending = sm.getPendingRequest(sessionId, requestIdStr);
       if (!pending) return;
 
-      if ((pending as any)._chunks) {
-        (pending as any)._chunks.push(Buffer.from(frame.data!));
+      if ((pending as any)._writeChunk) {
+        (pending as any)._writeChunk(Buffer.from(frame.data!));
       }
       break;
     }
@@ -59,10 +59,8 @@ export function routeFrame(
       const pending = sm.getPendingRequest(sessionId, requestIdStr);
       if (!pending) return;
 
-      (pending as any)._ended = true;
-
-      if ((pending as any)._endResolve) {
-        (pending as any)._endResolve();
+      if ((pending as any)._finishResponse) {
+        (pending as any)._finishResponse();
       }
       break;
     }
