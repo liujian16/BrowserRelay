@@ -11,7 +11,9 @@ import { HEARTBEAT_INTERVAL_MS } from '../util/constants.js';
 
 export function wsHandler(sm: SessionManager) {
   return (socket: WebSocket, request: FastifyRequest) => {
-    const token = (request.query as Record<string, string>).token;
+    // Parse token from query string
+    const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+    const token = url.searchParams.get('token') ?? undefined;
 
     // Validate token
     const session = sm.consumeWsToken(token);
@@ -33,12 +35,10 @@ export function wsHandler(sm: SessionManager) {
       const frame = decodeFrame(data);
 
       if (frame.type === MessageType.PONG) {
-        // Pong reply to our heartbeat — ignore
         return;
       }
 
       if (frame.type === MessageType.PING) {
-        // Browser sends protocol PING — reply with PONG
         socket.send(encodePong());
         return;
       }
@@ -50,8 +50,6 @@ export function wsHandler(sm: SessionManager) {
     // Heartbeat
     const heartbeat = setInterval(() => {
       if (socket.readyState === 1) {
-        // PING is sent by the server; browser should reply PONG
-        // We rely on the ws library's built-in ping/pong for keepalive
         socket.ping();
       }
     }, HEARTBEAT_INTERVAL_MS);

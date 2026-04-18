@@ -32,8 +32,14 @@ export function createServer(): FastifyInstance {
 
   // Routes
   fastify.post('/login', loginRoute(sm));
-  fastify.get('/ws', { websocket: true }, wsHandler(sm));
   fastify.post('/app', appRoute(sm));
+
+  // WebSocket route MUST be registered inside a plugin context
+  // for @fastify/websocket to properly detect websocket: true
+  fastify.register(async function (fastify) {
+    fastify.get('/ws', { websocket: true }, wsHandler(sm));
+  });
+
   fastify.register(proxyHandler(sm));
 
   return fastify;
